@@ -206,6 +206,116 @@ __global__ void search_kernel_v2(const float* __restrict__ stats,
 }
 
 // ---------------------------------------------------------------------------
+// v4: two-phase stream compaction -- the GPU's answer to the pruned CPU.
+// The flat prefix decomposition of v3 must bound-check all 374M prefixes;
+// the CPU's nested loops kill whole subtrees at the pair level and won. v4
+// rebuilds that hierarchy on the GPU as an expand-filter-compact pipeline:
+//   pairs (22,344) -> survivors -> x armor -> survivors -> x necklace ->
+//   surviving 4-slot prefixes -> v3-style inner ring/shoe search.
+// Each stage appends survivors to a dense array with atomicAdd, so the next
+// stage launches exactly as many threads as there is live work: the sparse
+// hierarchical workload becomes dense and uniform again -- GPU territory.
+struct SurvA { uint32_t i0, i1; float part[N_STATS]; };
+struct SurvB { uint32_t i0, i1, i2; float part[N_STATS]; };
+struct SurvC { uint32_t i0, i1, i2, i3; float part[N_STATS]; };
+
+__global__ void pair_kernel(const float* __restrict__ stats, float tail, float goal,
+                            SurvA* __restrict__ out, uint32_t* __restrict__ n_out) {
+    uint32_t pair = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t all = d_counts[0] * d_counts[1];
+    if (pair >= all) return;
+    uint32_t i0 = pair / d_counts[1], i1 = pair % d_counts[1];
+    float part[N_STATS];
+    for (int s = 0; s < N_STATS; s++) part[s] = d_ctx.fixed[s];
+    const float* v0 = stats + (size_t)(d_offsets[0] + i0) * N_STATS;
+    const float* v1 = stats + (size_t)(d_offsets[1] + i1) * N_STATS;
+    for (int s = 0; s < N_STATS; s++) part[s] += v0[s] + v1[s];
+    if (part[3] + tail < goal) return;
+    uint32_t slot = atomicAdd(n_out, 1u);
+    out[slot].i0 = i0; out[slot].i1 = i1;
+    for (int s = 0; s < N_STATS; s++) out[slot].part[s] = part[s];
+}
+
+template <int PART_NO, typename IN, typename OUT>
+__global__ void expand_kernel(const float* __restrict__ stats, const IN* __restrict__ in,
+                              uint32_t n_in, float tail, float goal,
+                              OUT* __restrict__ out, uint32_t* __restrict__ n_out,
+                              uint32_t cap) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t n_items = d_counts[PART_NO];
+    if (tid >= n_in * n_items) return;
+    uint32_t si = tid / n_items, item = tid % n_items;
+    const IN& s_in = in[si];
+    float part[N_STATS];
+    const float* v = stats + (size_t)(d_offsets[PART_NO] + item) * N_STATS;
+    for (int s = 0; s < N_STATS; s++) part[s] = s_in.part[s] + v[s];
+    if (part[3] + tail < goal) return;
+    uint32_t slot = atomicAdd(n_out, 1u);
+    if (slot >= cap) return;                 // host checks n_out > cap and aborts
+    OUT& o = out[slot];
+    o.i0 = s_in.i0; o.i1 = s_in.i1;
+    if constexpr (PART_NO == 2) { o.i2 = item; }
+    else { o.i2 = s_in.i2; o.i3 = item; }
+    for (int s = 0; s < N_STATS; s++) o.part[s] = part[s];
+}
+
+__global__ void final_kernel(const float* __restrict__ stats,
+                             const int32_t* __restrict__ set_id,
+                             const SurvC* __restrict__ in, uint32_t n_in,
+                             float threshold, float bound_shoe,
+                             Candidate* __restrict__ buffer, uint32_t* __restrict__ buf_count,
+                             unsigned int* __restrict__ best_bits,
+                             unsigned long long* __restrict__ feasible_count) {
+    uint32_t si = blockIdx.x * blockDim.x + threadIdx.x;
+    if (si >= n_in) return;
+    const SurvC& sc = in[si];
+    const uint32_t rings = d_counts[4], shoes = d_counts[5];
+    const uint64_t inner = (uint64_t)rings * shoes;
+    const uint32_t c1 = d_counts[1], c2 = d_counts[2], c3 = d_counts[3];
+    uint64_t pre = (((uint64_t)sc.i0 * c1 + sc.i1) * c2 + sc.i2) * c3 + sc.i3;
+
+    int32_t sid[N_PARTS];
+    sid[0] = set_id[d_offsets[0] + sc.i0];
+    sid[1] = set_id[d_offsets[1] + sc.i1];
+    sid[2] = set_id[d_offsets[2] + sc.i2];
+    sid[3] = set_id[d_offsets[3] + sc.i3];
+
+    unsigned long long local_feasible = 0;
+    float local_best = -1.0f;
+    for (uint32_t r = 0; r < rings; r++) {
+        uint32_t flat_r = d_offsets[4] + r;
+        sid[4] = set_id[flat_r];
+        const float* vr = stats + (size_t)flat_r * N_STATS;
+        float part5[N_STATS];
+        for (int s = 0; s < N_STATS; s++) part5[s] = sc.part[s] + vr[s];
+        if (part5[3] + bound_shoe < d_ctx.spd_min - 1e-3f) continue;
+
+        for (uint32_t sh = 0; sh < shoes; sh++) {
+            uint32_t flat_s = d_offsets[5] + sh;
+            sid[5] = set_id[flat_s];
+            const float* vs = stats + (size_t)flat_s * N_STATS;
+            float panel[N_STATS];
+            for (int s = 0; s < N_STATS; s++) panel[s] = part5[s] + vs[s];
+            auto res = finish_eval<float>(d_ctx, panel, sid);
+            if (!res.feasible) continue;
+            local_feasible++;
+            local_best = fmaxf(local_best, res.dmg);
+            if (res.dmg >= threshold) {
+                uint64_t lin = pre * inner + (uint64_t)r * shoes + sh;
+                uint32_t slot = atomicAdd(buf_count, 1u);
+                if (slot < BUFFER_CAP) {
+                    buffer[slot].dmg = res.dmg;
+                    buffer[slot].lo = (uint32_t)(lin & 0xffffffffu);
+                    buffer[slot].hi = (uint32_t)(lin >> 32);
+                }
+            }
+        }
+    }
+    if (local_feasible) atomicAdd(feasible_count, local_feasible);
+    if (local_best > 0.0f) atomicMax(best_bits, __float_as_uint(local_best));
+}
+
+// ---------------------------------------------------------------------------
 static void decode(uint64_t lin, const uint32_t* counts, uint32_t* idx) {
     for (int p = N_PARTS - 1; p > 0; p--) { idx[p] = (uint32_t)(lin % counts[p]); lin /= counts[p]; }
     idx[0] = (uint32_t)lin;
@@ -314,6 +424,94 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaEventCreate(&ev0));
     CUDA_CHECK(cudaEventCreate(&ev1));
     CUDA_CHECK(cudaEventRecord(ev0));
+    if (mode == "search4") {
+        // Admissible per-level tails, same construction as the CPU baseline.
+        float max_spd[N_PARTS] = {};
+        for (int part = 2; part < N_PARTS; part++)
+            for (uint32_t i = 0; i < p.counts[part]; i++)
+                max_spd[part] = std::max(max_spd[part],
+                    p.stats[((size_t)p.offsets[part] + i) * N_STATS + 3]);
+        float set_delta = 0;
+        for (int i = 0; i < p.ctx.n_sets; i++) {
+            const SetEntry& e = p.ctx.sets[i];
+            if (e.stat_idx != 3) continue;
+            for (int t = 0; t < 3; t++)
+                if (e.amounts[t] != 0)
+                    set_delta = std::max(set_delta, e.of_base
+                        ? rintf(p.ctx.raw4[3] * e.amounts[t] / 100.0f) : e.amounts[t]);
+        }
+        float tail_ring = max_spd[5] + set_delta;
+        float tail_neck = max_spd[4] + tail_ring;
+        float tail_armor = max_spd[3] + tail_neck;
+        float tail_pair = max_spd[2] + tail_armor;
+        float goal = p.ctx.spd_min - 1e-3f;
+
+        uint32_t all_pairs = p.counts[0] * p.counts[1];
+        const uint32_t capB = 1u << 22, capC = 1u << 22;
+        SurvA* d_sa; SurvB* d_sb; SurvC* d_sc; uint32_t* d_n;
+        CUDA_CHECK(cudaMalloc(&d_sa, sizeof(SurvA) * all_pairs));
+        CUDA_CHECK(cudaMalloc(&d_sb, sizeof(SurvB) * capB));
+        CUDA_CHECK(cudaMalloc(&d_sc, sizeof(SurvC) * capC));
+        CUDA_CHECK(cudaMalloc(&d_n, 4 * 3));
+        CUDA_CHECK(cudaMemset(d_n, 0, 4 * 3));
+
+        cudaEvent_t e0, e1;
+        CUDA_CHECK(cudaEventCreate(&e0)); CUDA_CHECK(cudaEventCreate(&e1));
+        CUDA_CHECK(cudaEventRecord(e0));
+        pair_kernel<<<(all_pairs + 255) / 256, 256>>>(d_stats, tail_pair, goal, d_sa, d_n);
+        uint32_t nA, nB, nC;
+        CUDA_CHECK(cudaMemcpy(&nA, d_n, 4, cudaMemcpyDeviceToHost));
+        expand_kernel<2, SurvA, SurvB><<<((uint64_t)nA * p.counts[2] + 255) / 256, 256>>>(
+            d_stats, d_sa, nA, tail_armor, goal, d_sb, d_n + 1, capB);
+        CUDA_CHECK(cudaMemcpy(&nB, d_n + 1, 4, cudaMemcpyDeviceToHost));
+        if (nB > capB) { std::printf("stage B overflow (%u)\n", nB); return 1; }
+        expand_kernel<3, SurvB, SurvC><<<((uint64_t)nB * p.counts[3] + 255) / 256, 256>>>(
+            d_stats, d_sb, nB, tail_neck, goal, d_sc, d_n + 2, capC);
+        CUDA_CHECK(cudaMemcpy(&nC, d_n + 2, 4, cudaMemcpyDeviceToHost));
+        if (nC > capC) { std::printf("stage C overflow (%u)\n", nC); return 1; }
+        final_kernel<<<(nC + 255) / 256, 256>>>(d_stats, d_set, d_sc, nC,
+                                                threshold, tail_ring,
+                                                d_buf, d_count, d_best, d_feas);
+        CUDA_CHECK(cudaEventRecord(e1));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        float ms4 = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&ms4, e0, e1));
+        std::printf("compaction     pairs %u -> %u   x armor -> %u   x necklace -> %u prefixes\n",
+                    all_pairs, nA, nB, nC);
+        std::printf("searched       %.3e combos (covered) in %.4f s\n",
+                    (double)p.space, ms4 / 1e3);
+
+        uint32_t n_cand4; unsigned int bb4; unsigned long long feas4;
+        CUDA_CHECK(cudaMemcpy(&n_cand4, d_count, 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&bb4, d_best, 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&feas4, d_feas, 8, cudaMemcpyDeviceToHost));
+        float best4 = 0; std::memcpy(&best4, &bb4, 4);
+        std::printf("feasible       %llu\nglobal best    %.3f (f32)\ncandidates     %u >= threshold %.1f\n",
+                    feas4, best4, n_cand4, threshold);
+        std::vector<Candidate> cand4(std::min(n_cand4, BUFFER_CAP));
+        CUDA_CHECK(cudaMemcpy(cand4.data(), d_buf, sizeof(Candidate) * cand4.size(),
+                              cudaMemcpyDeviceToHost));
+        std::sort(cand4.begin(), cand4.end(),
+                  [](const Candidate& a, const Candidate& b) { return a.dmg > b.dmg; });
+        int n_out4 = std::min<size_t>(cand4.size(), 4096);
+        std::vector<std::pair<double, uint64_t>> exact4(n_out4);
+        for (int i = 0; i < n_out4; i++) {
+            uint64_t lin = ((uint64_t)cand4[i].hi << 32) | cand4[i].lo;
+            uint32_t idx[N_PARTS];
+            decode(lin, p.counts, idx);
+            auto r = eval_combo<double>(p.ctx, p.stats.data(), p.set_id.data(), p.offsets, idx);
+            exact4[i] = { r.dmg, lin };
+        }
+        std::sort(exact4.begin(), exact4.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        for (int i = 0; i < std::min(TOP_K, n_out4); i++) {
+            uint32_t idx[N_PARTS];
+            decode(exact4[i].second, p.counts, idx);
+            std::printf("  #%-2d %12.3f   [%u %u %u %u %u %u]\n", i + 1, exact4[i].first,
+                        idx[0], idx[1], idx[2], idx[3], idx[4], idx[5]);
+        }
+        return 0;
+    }
+
     if (mode == "search2" || mode == "search3") {
         const bool prune = mode == "search3";
         // Admissible spd upper bounds for the pruned variant (see kernel doc).

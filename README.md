@@ -23,14 +23,15 @@ That design exists because the exact exhaustive search is out of reach on CPU:
 | C++ naive, OpenMP ×16 | yes | ~14 h (measured 7.4×10⁷ evals/s) |
 | CUDA v1 naive | yes | 199.6 s |
 | CUDA v2 hoisted partials | yes | 165.1 s |
-| CUDA v3 + admissible pruning | yes | 0.51 s |
+| CUDA v3 + admissible pruning (flat) | yes | 0.51 s |
 | C++ pruned, 1 thread | yes | 1.89 s |
-| **C++ pruned, OpenMP ×16** | **yes** | **0.38 s** |
+| C++ pruned, OpenMP ×16 | yes | 0.38 s |
+| **CUDA v4 stream compaction** | **yes** | **0.0316 s** |
 
 GPU: RTX 4070 Ti Super. The attribution these rows force is the actual point
-of this repo — see "Where the speed really came from" below. Either exact
-pruned solver **beats the 0.7 s surrogate outright**: the approximation is no
-longer even the fast option on this instance.
+of this repo — see "Where the speed really came from" below. The exact
+answer now costs 1/22nd of the surrogate approximation (0.7 s): the
+heuristic is fully obsolete on this instance.
 
 The GPU version evaluates the **exact objective on every one of the
 3,713,477,331,600 combinations** and answers the question the surrogate never
@@ -136,18 +137,25 @@ The honest attribution:
   everything else in this repo.
 - **The GPU is worth ~250–300× on brute force** (199.6 s vs 43 h naive;
   165 s vs 14 h) — parallel hardware pays when the work is dense and uniform.
-- **On the pruned workload the GPU loses to a multicore CPU**, and the reason
-  is structural, not incidental: the GPU's flat prefix decomposition must
-  bound-check all 374M prefixes, while the CPU's loop nest prunes whole
-  subtrees at the pair and armor levels (22,344 pair checks kill most of the
-  tree before it exists). The best optimization *changed the shape of the
-  workload* — from dense-uniform (GPU territory) to sparse-hierarchical
-  (CPU territory). Winning it back on the GPU has a name: two-phase stream
-  compaction of surviving prefixes. Identified, not yet implemented.
+- **On the pruned workload the flat GPU decomposition loses to a multicore
+  CPU**, and the reason is structural, not incidental: v3 must bound-check
+  all 374M prefixes, while the CPU's loop nest prunes whole subtrees at the
+  pair and armor levels (22,344 pair checks kill most of the tree before it
+  exists). The best optimization *changed the shape of the workload* — from
+  dense-uniform (GPU territory) to sparse-hierarchical (CPU territory).
+- **Restructuring the GPU wins it back decisively (v4, `search4`).** The
+  CPU's loop hierarchy is rebuilt on the GPU as an expand-filter-compact
+  pipeline: pairs → filter (22,344 → 8,819) → ×armor → filter (54,202) →
+  ×necklace → filter (183,793 surviving prefixes) → dense inner search. Each
+  stage appends survivors to a dense array with `atomicAdd`, so the next
+  stage launches exactly as much work as is alive — the sparse hierarchical
+  workload becomes dense and uniform again, which is GPU territory.
+  **0.0316 s: 12× the best CPU, 6,300× the naive GPU.**
 
 Practical fallout: the CPU tool's surrogate is now obsolete for this query
-shape — `search_pruned` is exact *and* faster (0.38 s vs 0.7 s), and could
-replace the surrogate as ArkBuildPicker's engine.
+shape — `search_pruned` (0.38 s, no GPU needed) and `search4` (0.03 s) are
+both exact *and* faster than the 0.7 s approximation; either could replace
+the surrogate as ArkBuildPicker's engine.
 
 **Constraint caveat.** Every pruned number feeds on spd ≥ 228 being brutally
 selective. An unconstrained query prunes nothing and runs at v2 speed on the
@@ -164,7 +172,9 @@ build\gpu_search.exe validate         # GPU f32 vs Python ground truth
 build\gpu_search.exe ablate           # decode-cost ablation
 build\gpu_search.exe search  --threshold 9800   # v1 naive
 build\gpu_search.exe search2 --threshold 9800   # v2 hoisted partials
-build\gpu_search.exe search3 --threshold 9800   # v3 + admissible pruning
+build\gpu_search.exe search3 --threshold 9800   # v3 + admissible pruning (flat)
+build\gpu_search.exe search4 --threshold 9800   # v4 stream compaction
+build\reference.exe search_pruned               # strongest CPU baseline
 python report.py <six winning indices> --compare
 ```
 
