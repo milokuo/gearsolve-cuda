@@ -16,18 +16,21 @@ only the top 120 finalists.
 
 That design exists because the exact exhaustive search is out of reach on CPU:
 
-| solver | exact? | throughput | full-space time |
-|---|---|---|---|
-| Python tool (surrogate + rerank) | no — linearized | — | 0.7 s |
-| C++ single thread, exact | yes | 2.4×10⁷ evals/s | ~43 h (extrapolated) |
-| C++ OpenMP ×16, exact | yes | 7.4×10⁷ evals/s | ~14 h (extrapolated) |
-| CUDA v1 naive | yes | 1.86×10¹⁰ evals/s | 199.6 s |
-| CUDA v2 hoisted partials | yes | 2.25×10¹⁰ evals/s | 165.1 s |
-| **CUDA v3 + admissible pruning** | **yes** | **7.24×10¹² combos/s effective** | **0.51 s** |
+| solver | exact? | full-space result |
+|---|---|---|
+| Python tool (surrogate + rerank) | no — linearized | 0.7 s |
+| C++ naive, 1 thread | yes | ~43 h (measured 2.4×10⁷ evals/s) |
+| C++ naive, OpenMP ×16 | yes | ~14 h (measured 7.4×10⁷ evals/s) |
+| CUDA v1 naive | yes | 199.6 s |
+| CUDA v2 hoisted partials | yes | 165.1 s |
+| CUDA v3 + admissible pruning | yes | 0.51 s |
+| C++ pruned, 1 thread | yes | 1.89 s |
+| **C++ pruned, OpenMP ×16** | **yes** | **0.38 s** |
 
-All measured on an RTX 4070 Ti Super. **The exact exhaustive search now beats
-the CPU surrogate's own 0.7 s** — the approximation is no longer even the
-fast option on this instance.
+GPU: RTX 4070 Ti Super. The attribution these rows force is the actual point
+of this repo — see "Where the speed really came from" below. Either exact
+pruned solver **beats the 0.7 s surrogate outright**: the approximation is no
+longer even the fast option on this instance.
 
 The GPU version evaluates the **exact objective on every one of the
 3,713,477,331,600 combinations** and answers the question the surrogate never
@@ -111,13 +114,45 @@ feasible count (163,108), best (9881.498) and candidate set — the safety
 argument, checked empirically.
 
 **Not pursued, deliberately.** Shared-memory staging of the item table was on
-the roadmap; after v3 the surviving evals are too few for their memory traffic
-to matter, so it would optimize a cost that no longer exists. Recorded here
-because *deciding not to optimize* is also a measurement-driven decision.
+the roadmap; two measurements killed it. v2's mere 1.21× showed the bottleneck
+was `finish_eval` compute, not item loads (the whole table is 27 KB and the
+inner working set 3 KB — L1 already holds it), and after v3 the loads it
+would stage mostly never happen. Recorded because *deciding not to optimize*
+is also a measurement-driven decision.
 
-**Honest caveat.** The 0.51 s is constraint-dependent: the bound feeds on
-spd ≥ 228 being brutally selective. An unconstrained query does no pruning
-and runs at v2 speed (~165 s). The table reports both.
+## Where the speed really came from
+
+After the GPU hit 0.51 s I wrote the strongest CPU baseline I could to attack
+my own result (`reference search_pruned`): the same admissible bound, but
+placed at **every** level of a nested loop — a bound after the weapon/helmet
+pair alone discards 1.24M-combo subtrees — with fully hoisted partial panels.
+Single-threaded it covers the full space in **1.89 s**; sixteen threads,
+**0.38 s — faster than the GPU's 0.51 s**. All invariants reproduced
+(163,108 feasible; only 6.05×10⁷ evals actually run, 0.00163% of the space).
+
+The honest attribution:
+
+- **The admissible bound is worth ~4 orders of magnitude.** It dominates
+  everything else in this repo.
+- **The GPU is worth ~250–300× on brute force** (199.6 s vs 43 h naive;
+  165 s vs 14 h) — parallel hardware pays when the work is dense and uniform.
+- **On the pruned workload the GPU loses to a multicore CPU**, and the reason
+  is structural, not incidental: the GPU's flat prefix decomposition must
+  bound-check all 374M prefixes, while the CPU's loop nest prunes whole
+  subtrees at the pair and armor levels (22,344 pair checks kill most of the
+  tree before it exists). The best optimization *changed the shape of the
+  workload* — from dense-uniform (GPU territory) to sparse-hierarchical
+  (CPU territory). Winning it back on the GPU has a name: two-phase stream
+  compaction of surviving prefixes. Identified, not yet implemented.
+
+Practical fallout: the CPU tool's surrogate is now obsolete for this query
+shape — `search_pruned` is exact *and* faster (0.38 s vs 0.7 s), and could
+replace the surrogate as ArkBuildPicker's engine.
+
+**Constraint caveat.** Every pruned number feeds on spd ≥ 228 being brutally
+selective. An unconstrained query prunes nothing and runs at v2 speed on the
+GPU (~165 s) — where the GPU's 250× over CPU naive is the story again. Which
+solver wins depends on the instance; knowing that is the job.
 
 ## Usage
 

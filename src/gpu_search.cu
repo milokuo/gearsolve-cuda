@@ -3,7 +3,7 @@
 //
 //   gpu_search validate                        eval the embedded ground-truth
 //                                              combos on device, compare
-//   gpu_search search [--threshold X] [--limit N]
+//   gpu_search search|search2|search3 [--threshold X] [--limit N]
 //        every feasible combo scoring >= X is appended to a candidate buffer
 //        (atomic); the host re-scores candidates in double and prints top-16.
 //        The global maximum is also tracked with an atomicMax so an overflow
