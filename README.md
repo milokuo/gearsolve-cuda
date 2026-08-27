@@ -21,7 +21,13 @@ That design exists because the exact exhaustive search is out of reach on CPU:
 | Python tool (surrogate + rerank) | no — linearized | — | 0.7 s |
 | C++ single thread, exact | yes | 2.4×10⁷ evals/s | ~43 h (extrapolated) |
 | C++ OpenMP ×16, exact | yes | 7.4×10⁷ evals/s | ~14 h (extrapolated) |
-| **CUDA v1 naive, RTX 4070 Ti Super** | **yes** | **1.86×10¹⁰ evals/s** | **199.6 s, measured** |
+| CUDA v1 naive | yes | 1.86×10¹⁰ evals/s | 199.6 s |
+| CUDA v2 hoisted partials | yes | 2.25×10¹⁰ evals/s | 165.1 s |
+| **CUDA v3 + admissible pruning** | **yes** | **7.24×10¹² combos/s effective** | **0.51 s** |
+
+All measured on an RTX 4070 Ti Super. **The exact exhaustive search now beats
+the CPU surrogate's own 0.7 s** — the approximation is no longer even the
+fast option on this instance.
 
 The GPU version evaluates the **exact objective on every one of the
 3,713,477,331,600 combinations** and answers the question the surrogate never
@@ -72,25 +78,58 @@ for itself. (The tool's displayed 9876.8 vs the exact 9875.7 on rank 2 traces
 to its *display* path rounding projected substats of a +12 item to 0.1 before
 re-scoring — the solvers here all score the canonical staged vectors.)
 
-So: the surrogate stays the interactive path (0.7 s), but "is the heuristic
-actually right?" changed from *unanswerable* to *a three-minute GPU job*.
+So "is the heuristic actually right?" changed from *unanswerable* to *a
+half-second GPU job*.
 
-### Roadmap (v2)
+## Optimization log (measure → change → measure)
 
-Measured next steps, in profile-first order: pin the two innermost slots to
-the thread and hoist the 4-slot partial panel out of their loops (turns most
-of the eval into a handful of adds); kill the per-combo 64-bit div/mod decode;
-stage item vectors in shared memory; skip evals that a per-slot speed bound
-already proves infeasible; Nsight Compute before/after for each.
+**Profiling note.** Nsight Compute hit `ERR_NVGPUCTRPERM` (the driver
+restricts GPU performance counters to admin on Windows), so attribution was
+done by ablation instead: a kernel that runs *only* v1's per-combo 64-bit
+mixed-radix decode measured **32.9 ms vs 107.1 ms for the full v1 slice — the
+decode alone is 31% of v1**. Pure bookkeeping, no work.
+
+**v2 — hoist partial sums, kill the 64-bit decode.** One thread owns a 4-slot
+prefix and loops rings×shoes (9,922 combos) itself: the 4-slot panel is summed
+once per prefix, the 5-slot panel once per ring, and the decode shrinks to
+three 32-bit divmods per 9,922 combos. Predicted a big win; **measured only
+1.21× (199.6 s → 165.1 s)**. Lesson: with the bookkeeping gone, the bottleneck
+moved to `finish_eval` — the set-counting branches and the damage math that
+every combo still runs. The prediction was wrong and the measurement caught
+it; that is the entire point of measuring.
+
+**v3 — admissible speed bound (`search3`).** Only 163,108 of 3.7×10¹² combos
+(4.4×10⁻⁸) can satisfy spd ≥ 228, so almost every eval was doomed before it
+started. v3 skips a whole prefix (9,922 combos) or a whole ring (82 combos)
+when even an *upper bound* on reachable speed — max remaining item spd plus
+the largest spd any single set completion can add, `rint(16% × raw spd)`;
+two 4-piece spd sets cannot fit in six slots — cannot reach the constraint.
+The same suffix-bound idea the CPU tool's DFS uses, made admissible so a
+pruned branch provably contains no feasible combo. **Measured: 165.1 s →
+0.51 s (324×)**, and the pruned run reproduces the unpruned run's exact
+feasible count (163,108), best (9881.498) and candidate set — the safety
+argument, checked empirically.
+
+**Not pursued, deliberately.** Shared-memory staging of the item table was on
+the roadmap; after v3 the surviving evals are too few for their memory traffic
+to matter, so it would optimize a cost that no longer exists. Recorded here
+because *deciding not to optimize* is also a measurement-driven decision.
+
+**Honest caveat.** The 0.51 s is constraint-dependent: the bound feeds on
+spd ≥ 228 being brutally selective. An unconstrained query does no pruning
+and runs at v2 speed (~165 s). The table reports both.
 
 ## Usage
 
 ```
 python export_problem.py 歐貝恩絲 --buffed --debuffed --spd-min 228
 build.bat
-build\reference.exe validate
-build\gpu_search.exe validate
-build\gpu_search.exe search --threshold 9800
+build\reference.exe validate          # CPU f64/f32 vs Python ground truth
+build\gpu_search.exe validate         # GPU f32 vs Python ground truth
+build\gpu_search.exe ablate           # decode-cost ablation
+build\gpu_search.exe search  --threshold 9800   # v1 naive
+build\gpu_search.exe search2 --threshold 9800   # v2 hoisted partials
+build\gpu_search.exe search3 --threshold 9800   # v3 + admissible pruning
 python report.py <six winning indices> --compare
 ```
 

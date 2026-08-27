@@ -31,25 +31,12 @@ struct EvalResult {
     bool feasible;
 };
 
-// stats: flat [total_items][8]; set_id: flat [total_items];
-// offsets: first flat index of each part; idx: local item index per part.
+// Set effects, caps, constraints and the damage formula, given a summed panel
+// (fixed + six item vectors) and the six items' set ids. panel is modified in
+// place (set bonuses land on it). Split out so optimized kernels that build
+// the panel incrementally still share every line of the objective.
 template <typename T>
-GS_HD EvalResult<T> eval_combo(const Ctx& ctx,
-                               const float* stats, const int32_t* set_id,
-                               const uint32_t* offsets, const uint32_t* idx) {
-    // --- panel: fixed + the six item vectors (percentages were resolved and
-    // rounded per source at export time; items are plain adds here) ----------
-    T panel[N_STATS];
-    for (int s = 0; s < N_STATS; s++) panel[s] = (T)ctx.fixed[s];
-    uint32_t flat[N_PARTS];
-    int32_t sid[N_PARTS];
-    for (int p = 0; p < N_PARTS; p++) {
-        flat[p] = offsets[p] + idx[p];
-        sid[p] = set_id[flat[p]];
-        const float* v = stats + (size_t)flat[p] * N_STATS;
-        for (int s = 0; s < N_STATS; s++) panel[s] += (T)v[s];
-    }
-
+GS_HD EvalResult<T> finish_eval(const Ctx& ctx, T* panel, const int32_t* sid) {
     // --- set effects: the only coupling between slots -----------------------
     T other = (T)ctx.base_other;      // damage-multiplier addends land here
     T pen_extra = (T)0;               // extra DEF penetration (single target)
@@ -133,6 +120,26 @@ GS_HD EvalResult<T> eval_combo(const Ctx& ctx,
     }
     r.dmg = total;
     return r;
+}
+
+// stats: flat [total_items][8]; set_id: flat [total_items];
+// offsets: first flat index of each part; idx: local item index per part.
+template <typename T>
+GS_HD EvalResult<T> eval_combo(const Ctx& ctx,
+                               const float* stats, const int32_t* set_id,
+                               const uint32_t* offsets, const uint32_t* idx) {
+    // panel: fixed + the six item vectors (percentages were resolved and
+    // rounded per source at export time; items are plain adds here)
+    T panel[N_STATS];
+    for (int s = 0; s < N_STATS; s++) panel[s] = (T)ctx.fixed[s];
+    int32_t sid[N_PARTS];
+    for (int p = 0; p < N_PARTS; p++) {
+        uint32_t flat = offsets[p] + idx[p];
+        sid[p] = set_id[flat];
+        const float* v = stats + (size_t)flat * N_STATS;
+        for (int s = 0; s < N_STATS; s++) panel[s] += (T)v[s];
+    }
+    return finish_eval<T>(ctx, panel, sid);
 }
 
 } // namespace gs
